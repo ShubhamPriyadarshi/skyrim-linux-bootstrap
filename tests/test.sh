@@ -42,7 +42,7 @@ output="$(bash "$cli" doctor)"
 assert_contains "$output" "$skyrim"
 assert_contains "$output" "$prefix"
 
-[[ "$(bash "$cli" version)" == "0.1.0" ]]
+[[ "$(bash "$cli" version)" == "0.1.1" ]]
 
 bash "$cli" fix-display 1440 900
 grep -q '^Fullscreen=false$' "$skyrim/Data/SKSE/Plugins/SSEDisplayTweaks.ini"
@@ -63,7 +63,7 @@ HOME="$install_home" XDG_DATA_HOME="$install_home/.local/share" bash "$project_d
 [[ -L "$install_home/.local/bin/skyrim-linux-bootstrap" ]]
 [[ -f "$install_home/.local/share/applications/skyrim-linux-bootstrap.desktop" ]]
 installed_version="$(HOME="$install_home" "$install_home/.local/bin/skyrim-linux-bootstrap" version 2>"$fixture/version.err")"
-[[ "$installed_version" == "0.1.0" ]]
+[[ "$installed_version" == "0.1.1" ]]
 [[ ! -s "$fixture/version.err" ]]
 
 printf 'All tests passed.\n'

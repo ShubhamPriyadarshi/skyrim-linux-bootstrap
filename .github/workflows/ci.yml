@@ -11,7 +11,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install ShellCheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: Check Bash syntax
@@ -30,15 +30,16 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build portable archive
         run: |
           mkdir -p dist
           tar --exclude-vcs --exclude=dist -czf "dist/skyrim-linux-bootstrap-${GITHUB_REF_NAME}.tar.gz" .
-          sha256sum dist/*.tar.gz > dist/SHA256SUMS
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            dist/*.tar.gz
-            dist/SHA256SUMS
-
+          (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/*.tar.gz dist/SHA256SUMS \
+            --verify-tag --generate-notes --title "$GITHUB_REF_NAME"

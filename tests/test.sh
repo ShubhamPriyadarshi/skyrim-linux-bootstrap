@@ -12,6 +12,7 @@ skyrim="$steam_root/steamapps/common/Skyrim Special Edition"
 prefix="$steam_root/steamapps/compatdata/489830/pfx"
 mkdir -p "$fake_home" "$skyrim/Data/SKSE/Plugins" "$prefix/drive_c"
 touch "$skyrim/SkyrimSE.exe"
+mkdir -p "$prefix/drive_c/Program Files/dotnet/shared/Microsoft.WindowsDesktop.App/9.0.99"
 
 cat >"$skyrim/Data/SKSE/Plugins/SSEDisplayTweaks.ini" <<'EOF'
 [Main]
@@ -41,8 +42,9 @@ assert_contains() {
 output="$(bash "$cli" doctor)"
 assert_contains "$output" "$skyrim"
 assert_contains "$output" "$prefix"
+assert_contains "$output" "9.0.99 (Windows x64)"
 
-[[ "$(bash "$cli" version)" == "0.1.2" ]]
+[[ "$(bash "$cli" version)" == "0.1.3" ]]
 
 bash "$cli" fix-display 1440 900
 grep -q '^Fullscreen=false$' "$skyrim/Data/SKSE/Plugins/SSEDisplayTweaks.ini"
@@ -57,13 +59,36 @@ if [[ "$dry_output" != *"Would create"* && "$dry_output" != *"Protontricks"* ]];
   exit 1
 fi
 
+fake_bin="$fixture/bin"
+runtime_installer="$fixture/windowsdesktop-runtime-win-x64.exe"
+mkdir -p "$fake_bin"
+touch "$runtime_installer"
+cat >"$fake_bin/protontricks-launch" <<'EOF'
+#!/usr/bin/env bash
+[[ -z "${DOTNET_ROOT+x}" ]]
+[[ -z "${DOTNET_ROOT_X64+x}" ]]
+printf 'launched\n' >"$SLB_TEST_LAUNCH_LOG"
+exit 0
+EOF
+chmod 0755 "$fake_bin/protontricks-launch"
+runtime_output="$(PATH="$fake_bin:$PATH" bash "$cli" --dry-run repair-vortex-runtime "$runtime_installer")"
+assert_contains "$runtime_output" "/repair"
+assert_contains "$runtime_output" "/quiet"
+probe="$prefix/drive_c/Program Files/Vortex/resources/app.asar.unpacked/assets/dotnetprobe.exe"
+mkdir -p "$(dirname -- "$probe")"
+touch "$probe"
+export SLB_TEST_LAUNCH_LOG="$fixture/launch.log"
+DOTNET_ROOT=/home/test/.dotnet DOTNET_ROOT_X64=/home/test/.dotnet \
+  PATH="$fake_bin:$PATH" bash "$cli" verify-vortex-runtime >/dev/null
+grep -q '^launched$' "$SLB_TEST_LAUNCH_LOG"
+
 install_home="$fixture/install-home"
 HOME="$install_home" XDG_DATA_HOME="$install_home/.local/share" bash "$project_dir/install.sh" >/dev/null
 [[ -x "$install_home/.local/share/skyrim-linux-bootstrap/bin/skyrim-linux-bootstrap" ]]
 [[ -L "$install_home/.local/bin/skyrim-linux-bootstrap" ]]
 [[ -f "$install_home/.local/share/applications/skyrim-linux-bootstrap.desktop" ]]
 installed_version="$(HOME="$install_home" "$install_home/.local/bin/skyrim-linux-bootstrap" version 2>"$fixture/version.err")"
-[[ "$installed_version" == "0.1.2" ]]
+[[ "$installed_version" == "0.1.3" ]]
 [[ ! -s "$fixture/version.err" ]]
 
 printf 'All tests passed.\n'

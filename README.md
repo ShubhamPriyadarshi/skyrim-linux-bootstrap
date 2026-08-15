@@ -13,6 +13,8 @@ credentials, access tokens, or proprietary artwork.
   Steam installations.
 - Finds Skyrim Special Edition and its Steam app `489830` Proton prefix.
 - Launches official Vortex and Keizaal Windows installers in the Skyrim prefix.
+- Installs and verifies Microsoft's Windows x64 .NET 9 Desktop Runtime before
+  Vortex, avoiding Vortex's unreliable in-app repair process under Proton.
 - Creates native desktop launchers for both applications.
 - Registers `nxm://` links with Vortex and `skyrim-rp://` callbacks with Keizaal.
 - Applies Vortex's Linux HiDPI scale without changing the system-wide scale.
@@ -80,6 +82,18 @@ desktops, and a terminal menu everywhere else.
    `skyrim-linux-bootstrap install-keizaal ~/Downloads/KeizaalLauncherSetup.exe`.
 7. Run `skyrim-linux-bootstrap patch-keizaal`.
 8. Run `skyrim-linux-bootstrap doctor` before starting the game.
+
+If Vortex reports that .NET Desktop Runtime 9 is required, close Vortex and run:
+
+```bash
+skyrim-linux-bootstrap repair-vortex-runtime
+```
+
+This downloads Microsoft's official Windows x64 runtime, repairs it inside the
+Skyrim Proton prefix, and runs Vortex's own bundled runtime probe. An offline
+installer can instead be supplied as the command's first argument. All generated
+launchers remove Linux `DOTNET_ROOT` variables from the Proton child process so
+Vortex resolves `C:\Program Files\dotnet`; the host shell remains unchanged.
 
 For a HiDPI base resolution such as 1440×900:
 

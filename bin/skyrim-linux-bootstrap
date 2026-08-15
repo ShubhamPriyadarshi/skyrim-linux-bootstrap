@@ -112,6 +112,18 @@ find_prefix() {
   return 1
 }
 
+find_dotnet9_runtime() {
+  local prefix="${1:-}" candidate
+  [[ -n "$prefix" ]] || prefix="$(find_prefix)" || return 1
+  for candidate in \
+    "$prefix/drive_c/Program Files/dotnet/shared/Microsoft.WindowsDesktop.App"/9.*; do
+    [[ -d "$candidate" ]] || continue
+    basename -- "$candidate"
+    return 0
+  done
+  return 1
+}
+
 backup_file() {
   local source="$1" stamp destination
   [[ -f "$source" ]] || return 0
@@ -122,7 +134,10 @@ backup_file() {
   log "Backup: $destination"
 }
 
-proton_launch() {
+proton_launch() (
+  # Linux SDK variables can override C:\Program Files\dotnet inside Wine and
+  # make Vortex reject an otherwise valid Windows Desktop Runtime install.
+  unset DOTNET_ROOT DOTNET_ROOT_X64 DOTNET_ROOT_X86 DOTNET_HOST_PATH DOTNET_MULTILEVEL_LOOKUP
   if command -v protontricks-launch >/dev/null 2>&1; then
     run protontricks-launch --appid "$appid" "$@"
   elif command -v flatpak >/dev/null 2>&1 && flatpak info com.github.Matoking.protontricks >/dev/null 2>&1; then
@@ -130,7 +145,7 @@ proton_launch() {
   else
     die "Protontricks is required. Run install-deps first."
   fi
-}
+)
 
 proton_launcher_command() {
   if command -v protontricks-launch >/dev/null 2>&1; then
@@ -162,7 +177,7 @@ print_doctor_item() {
 }
 
 doctor() {
-  local distro="unknown" skyrim="not found" prefix="not found" value status
+  local distro="unknown" skyrim="not found" prefix="not found" value status runtime
   if [[ -r /etc/os-release ]]; then
     # os-release is a standardized shell-compatible data file.
     # shellcheck source=/dev/null
@@ -212,6 +227,11 @@ doctor() {
   fi
 
   if [[ "$prefix" != "not found" ]]; then
+    if runtime="$(find_dotnet9_runtime "$prefix")"; then
+      print_doctor_item ".NET Desktop Runtime" "$runtime (Windows x64)" OK
+    else
+      print_doctor_item ".NET Desktop Runtime" "9.x Windows x64 not installed" MISSING
+    fi
     [[ -f "$prefix/drive_c/Program Files/Vortex/Vortex.exe" ]] && status=OK || status=MISSING
     print_doctor_item "Vortex" "$prefix/drive_c/Program Files/Vortex/Vortex.exe" "$status"
     value="$prefix/drive_c/users/steamuser/AppData/Local/Programs/skyrim-rp-launcher/skyrim-rp-launcher.exe"
@@ -277,11 +297,78 @@ print(matches[0] if matches else "")
   printf '%s\n' "$destination"
 }
 
+download_dotnet9_runtime() {
+  local destination="$state_home/downloads/windowsdesktop-runtime-9-win-x64.exe"
+  if [[ -n "${SLB_DOTNET_INSTALLER:-}" ]]; then
+    [[ -f "$SLB_DOTNET_INSTALLER" ]] || die "Runtime installer not found: $SLB_DOTNET_INSTALLER"
+    printf '%s\n' "$SLB_DOTNET_INSTALLER"
+    return
+  fi
+  install -d "$(dirname -- "$destination")"
+  log "Downloading Microsoft's official .NET 9 Desktop Runtime (Windows x64)." >&2
+  curl --fail --location --proto '=https' --tlsv1.2 \
+    --output "$destination" \
+    https://aka.ms/dotnet/9.0/windowsdesktop-runtime-win-x64.exe
+  printf '%s\n' "$destination"
+}
+
+verify_vortex_runtime() {
+  require_linux
+  local prefix runtime probe
+  prefix="$(find_prefix)" || die "Skyrim Proton prefix was not found. Launch Skyrim once from Steam."
+  runtime="$(find_dotnet9_runtime "$prefix")" || \
+    die ".NET 9 Desktop Runtime was not found in the Skyrim Proton prefix."
+  probe="$prefix/drive_c/Program Files/Vortex/resources/app.asar.unpacked/assets/dotnetprobe.exe"
+  if [[ -f "$probe" ]]; then
+    log "Running Vortex's bundled .NET 9 probe."
+    proton_launch "$probe" 9 || die "Vortex's .NET probe still fails. Close Vortex and run repair-vortex-runtime again."
+  fi
+  log ".NET Desktop Runtime $runtime is ready in the Skyrim Proton prefix."
+}
+
+install_vortex_runtime() {
+  require_linux
+  local mode="${1:-ensure}" supplied_installer="${2:-}" prefix installer action runtime
+  prefix="$(find_prefix)" || die "Skyrim Proton prefix was not found. Launch Skyrim once from Steam."
+  runtime="$(find_dotnet9_runtime "$prefix" 2>/dev/null || true)"
+  if [[ "$mode" == ensure && -n "$runtime" ]]; then
+    log ".NET Desktop Runtime $runtime is already installed."
+    return
+  fi
+  if [[ "$dry_run" == 0 ]] && pgrep -fi 'Vortex\.exe' >/dev/null 2>&1; then
+    warn "Vortex is running. Close it before repairing .NET, then re-run this command if verification fails."
+  fi
+  if [[ -n "$supplied_installer" ]]; then
+    [[ "$dry_run" == 1 || -f "$supplied_installer" ]] || die "Runtime installer not found: $supplied_installer"
+    installer="$supplied_installer"
+  elif [[ "$dry_run" == 1 ]]; then
+    installer="$state_home/downloads/windowsdesktop-runtime-9-win-x64.exe"
+    log "Would download Microsoft's official .NET 9 Desktop Runtime to $installer."
+  else
+    installer="$(download_dotnet9_runtime)"
+  fi
+  if [[ "$mode" == repair && -n "$runtime" ]]; then
+    action=/repair
+  else
+    action=/install
+  fi
+  log "Running .NET Desktop Runtime 9 $action inside Skyrim's Proton prefix."
+  proton_launch "$installer" "$action" /quiet /norestart
+  if [[ "$dry_run" == 0 ]]; then
+    verify_vortex_runtime
+  fi
+}
+
+repair_vortex_runtime() {
+  install_vortex_runtime repair "${1:-}"
+}
+
 install_vortex() {
   require_linux
   local installer="${1:-}"
   [[ -n "$installer" ]] || installer="$(download_vortex_installer)"
   [[ "$dry_run" == 1 || -f "$installer" ]] || die "Vortex installer not found: $installer"
+  install_vortex_runtime ensure
   log "Launching the official Vortex installer inside Skyrim's Proton prefix."
   proton_launch "$installer"
 }
@@ -298,12 +385,14 @@ write_vortex_wrapper() {
     cat >"$wrapper" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
+unset DOTNET_ROOT DOTNET_ROOT_X64 DOTNET_ROOT_X86 DOTNET_HOST_PATH DOTNET_MULTILEVEL_LOOKUP
 export ELECTRON_FORCE_DEVICE_SCALE_FACTOR="$zoom_factor"
 exec $launcher --appid $appid "$vortex_exe" "\$@"
 EOF
     cat >"$handler" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
+unset DOTNET_ROOT DOTNET_ROOT_X64 DOTNET_ROOT_X86 DOTNET_HOST_PATH DOTNET_MULTILEVEL_LOOKUP
 url="\${1:-}"
 [[ "\$url" == nxm://* ]] || exit 2
 export ELECTRON_FORCE_DEVICE_SCALE_FACTOR="$zoom_factor"
@@ -374,6 +463,7 @@ patch_keizaal() {
     cat >"$wrapper" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
+unset DOTNET_ROOT DOTNET_ROOT_X64 DOTNET_ROOT_X86 DOTNET_HOST_PATH DOTNET_MULTILEVEL_LOOKUP
 exec $proton_command --appid $appid "$launcher" "\$@"
 EOF
     chmod 0755 "$wrapper"
@@ -476,23 +566,25 @@ gui() {
   if command -v kdialog >/dev/null 2>&1; then
     choice="$(kdialog --title 'Skyrim Linux Bootstrap' --menu 'Choose an action' \
       setup 'Guided Vortex + Keizaal setup' doctor 'Run system doctor' deps 'Install dependencies' \
-      vortex-install 'Install Vortex' vortex-patch 'Patch Vortex and NXM links' \
+      vortex-install 'Install Vortex' vortex-runtime 'Repair Vortex .NET 9 runtime' \
+      vortex-patch 'Patch Vortex and NXM links' \
       keizaal-install 'Install Keizaal launcher' keizaal-patch 'Patch Keizaal and callback' \
       display 'Fix HiDPI/alt-tab resolution' audio 'Repair Keizaal voice audio' 2>/dev/null)" || return 0
   elif command -v zenity >/dev/null 2>&1; then
     choice="$(zenity --list --title='Skyrim Linux Bootstrap' --text='Choose an action' \
       --column=Action --column=Description \
       setup 'Guided Vortex + Keizaal setup' doctor 'Run system doctor' deps 'Install dependencies' \
-      vortex-install 'Install Vortex' vortex-patch 'Patch Vortex and NXM links' \
+      vortex-install 'Install Vortex' vortex-runtime 'Repair Vortex .NET 9 runtime' \
+      vortex-patch 'Patch Vortex and NXM links' \
       keizaal-install 'Install Keizaal launcher' keizaal-patch 'Patch Keizaal and callback' \
       display 'Fix HiDPI/alt-tab resolution' audio 'Repair Keizaal voice audio' 2>/dev/null)" || return 0
   else
-    printf '1) Guided setup\n2) Doctor\n3) Install dependencies\n4) Install Vortex\n5) Patch Vortex\n6) Install Keizaal\n7) Patch Keizaal\n8) Fix display\n9) Fix audio\n'
+    printf '1) Guided setup\n2) Doctor\n3) Install dependencies\n4) Install Vortex\n5) Repair Vortex .NET 9\n6) Patch Vortex\n7) Install Keizaal\n8) Patch Keizaal\n9) Fix display\n10) Fix audio\n'
     read -r -p 'Choice: ' choice
     case "$choice" in
       1) choice=setup ;; 2) choice=doctor ;; 3) choice=deps ;; 4) choice=vortex-install ;;
-      5) choice=vortex-patch ;; 6) choice=keizaal-install ;; 7) choice=keizaal-patch ;;
-      8) choice=display ;; 9) choice=audio ;;
+      5) choice=vortex-runtime ;; 6) choice=vortex-patch ;; 7) choice=keizaal-install ;;
+      8) choice=keizaal-patch ;; 9) choice=display ;; 10) choice=audio ;;
       *) return 0 ;;
     esac
   fi
@@ -510,6 +602,7 @@ gui() {
       installer="$(choose_exe)" || return 0
       install_vortex "$installer"
       ;;
+    vortex-runtime) repair_vortex_runtime ;;
     vortex-patch) patch_vortex ;;
     keizaal-install)
       installer="$(choose_exe)" || return 0
@@ -560,6 +653,8 @@ Commands:
   doctor                              Inspect the Steam, Proton and audio setup
   install-deps                        Install dependencies using the host package manager
   install-vortex [VortexSetup.exe]    Run the official installer in app 489830
+  repair-vortex-runtime [RUNTIME.exe] Repair and verify Vortex's .NET 9 runtime
+  verify-vortex-runtime               Run Vortex's bundled .NET 9 probe
   patch-vortex                        Add HiDPI launcher and nxm:// handling
   install-keizaal SETUP.exe           Run the official Keizaal installer
   patch-keizaal                       Add launcher and skyrim-rp:// callback
@@ -593,6 +688,8 @@ case "$command_name" in
   doctor) doctor "$@" ;;
   install-deps) install_deps "$@" ;;
   install-vortex) install_vortex "$@" ;;
+  repair-vortex-runtime) repair_vortex_runtime "$@" ;;
+  verify-vortex-runtime) verify_vortex_runtime "$@" ;;
   patch-vortex) patch_vortex "$@" ;;
   install-keizaal) install_keizaal "$@" ;;
   patch-keizaal) patch_keizaal "$@" ;;

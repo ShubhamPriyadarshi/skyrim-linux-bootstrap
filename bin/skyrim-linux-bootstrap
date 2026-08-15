@@ -1,0 +1,603 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_path="${BASH_SOURCE[0]}"
+while [[ -L "$script_path" ]]; do
+  script_dir="$(cd -P -- "$(dirname -- "$script_path")" && pwd)"
+  link_target="$(readlink -- "$script_path")"
+  if [[ "$link_target" == /* ]]; then
+    script_path="$link_target"
+  else
+    script_path="$script_dir/$link_target"
+  fi
+done
+script_dir="$(cd -P -- "$(dirname -- "$script_path")" && pwd)"
+project_dir="$(cd -- "$script_dir/.." && pwd)"
+version="$(<"$project_dir/VERSION")"
+appid=489830
+dry_run="${SLB_DRY_RUN:-0}"
+assume_yes=0
+zoom_factor="${SLB_VORTEX_ZOOM:-1.45}"
+
+state_home="${XDG_STATE_HOME:-$HOME/.local/state}/skyrim-linux-bootstrap"
+config_home="${XDG_CONFIG_HOME:-$HOME/.config}/skyrim-linux-bootstrap"
+data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
+applications_dir="$data_home/applications"
+bin_home="$HOME/.local/bin"
+backup_root="$state_home/backups"
+mkdir -p "$state_home" "$config_home"
+
+log() { printf '[slb] %s\n' "$*"; }
+warn() { printf '[slb] WARNING: %s\n' "$*" >&2; }
+die() { printf '[slb] ERROR: %s\n' "$*" >&2; exit 1; }
+
+run() {
+  if [[ "$dry_run" == 1 ]]; then
+    printf '[dry-run]'
+    printf ' %q' "$@"
+    printf '\n'
+  else
+    "$@"
+  fi
+}
+
+confirm() {
+  local prompt="$1"
+  [[ "$assume_yes" == 1 ]] && return 0
+  read -r -p "$prompt [y/N] " answer
+  [[ "$answer" =~ ^[Yy]$ ]]
+}
+
+require_linux() {
+  local kernel="${SLB_TEST_KERNEL:-$(uname -s)}"
+  [[ "$kernel" == Linux ]] || die "This command must run on Linux."
+}
+
+candidate_steam_roots() {
+  local root path vdf
+  if [[ -n "${SLB_STEAM_ROOTS:-}" ]]; then
+    tr ':' '\n' <<<"$SLB_STEAM_ROOTS"
+    return
+  fi
+
+  printf '%s\n' \
+    "$HOME/.local/share/Steam" \
+    "$HOME/.steam/steam" \
+    "$HOME/.var/app/com.valvesoftware.Steam/data/Steam" \
+    "$HOME/.var/app/com.valvesoftware.Steam/.local/share/Steam" \
+    "$HOME/snap/steam/common/.local/share/Steam" \
+    "/nvme/SteamLibrary" \
+    "/data/SteamLibrary"
+
+  for root in \
+    "$HOME/.local/share/Steam" \
+    "$HOME/.steam/steam" \
+    "$HOME/.var/app/com.valvesoftware.Steam/data/Steam" \
+    "$HOME/.var/app/com.valvesoftware.Steam/.local/share/Steam" \
+    "$HOME/snap/steam/common/.local/share/Steam"; do
+    vdf="$root/steamapps/libraryfolders.vdf"
+    [[ -f "$vdf" ]] || continue
+    while IFS= read -r path; do
+      path="${path//\\\\//}"
+      printf '%s\n' "$path"
+    done < <(sed -nE 's/^[[:space:]]*"path"[[:space:]]*"([^"]+)".*/\1/p' "$vdf")
+  done
+
+  for root in /mnt/*/SteamLibrary /run/media/"$USER"/*/SteamLibrary /media/"$USER"/*/SteamLibrary; do
+    [[ -d "$root" ]] && printf '%s\n' "$root"
+  done
+}
+
+steam_roots() {
+  candidate_steam_roots | awk 'NF && !seen[$0]++' | while IFS= read -r root; do
+    [[ -d "$root/steamapps" ]] && printf '%s\n' "$root"
+  done
+}
+
+find_skyrim_dir() {
+  local root candidate
+  while IFS= read -r root; do
+    candidate="$root/steamapps/common/Skyrim Special Edition"
+    [[ -f "$candidate/SkyrimSE.exe" ]] && { printf '%s\n' "$candidate"; return 0; }
+  done < <(steam_roots)
+  return 1
+}
+
+find_prefix() {
+  local root candidate
+  while IFS= read -r root; do
+    candidate="$root/steamapps/compatdata/$appid/pfx"
+    [[ -d "$candidate/drive_c" ]] && { printf '%s\n' "$candidate"; return 0; }
+  done < <(steam_roots)
+  return 1
+}
+
+backup_file() {
+  local source="$1" stamp destination
+  [[ -f "$source" ]] || return 0
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  destination="$backup_root/$stamp${source}"
+  run install -d "$(dirname -- "$destination")"
+  run cp -a "$source" "$destination"
+  log "Backup: $destination"
+}
+
+proton_launch() {
+  if command -v protontricks-launch >/dev/null 2>&1; then
+    run protontricks-launch --appid "$appid" "$@"
+  elif command -v flatpak >/dev/null 2>&1 && flatpak info com.github.Matoking.protontricks >/dev/null 2>&1; then
+    run flatpak run --command=protontricks-launch com.github.Matoking.protontricks --appid "$appid" "$@"
+  else
+    die "Protontricks is required. Run install-deps first."
+  fi
+}
+
+proton_launcher_command() {
+  if command -v protontricks-launch >/dev/null 2>&1; then
+    printf 'protontricks-launch'
+  elif command -v flatpak >/dev/null 2>&1 && flatpak info com.github.Matoking.protontricks >/dev/null 2>&1; then
+    printf 'flatpak run --command=protontricks-launch com.github.Matoking.protontricks'
+  else
+    return 1
+  fi
+}
+
+package_manager() {
+  if command -v pacman >/dev/null 2>&1; then printf pacman
+  elif command -v apt-get >/dev/null 2>&1; then printf apt
+  elif command -v dnf >/dev/null 2>&1; then printf dnf
+  elif command -v zypper >/dev/null 2>&1; then printf zypper
+  elif command -v apk >/dev/null 2>&1; then printf apk
+  else printf unknown
+  fi
+}
+
+is_immutable_system() {
+  [[ -e /run/ostree-booted || -r /etc/steamos-release ]]
+}
+
+print_doctor_item() {
+  local label="$1" value="$2" status="$3"
+  printf '%-24s %-8s %s\n' "$label" "$status" "$value"
+}
+
+doctor() {
+  local distro="unknown" skyrim="not found" prefix="not found" value status
+  if [[ -r /etc/os-release ]]; then
+    # os-release is a standardized shell-compatible data file.
+    # shellcheck source=/dev/null
+    distro="$(. /etc/os-release; printf '%s %s' "${NAME:-Linux}" "${VERSION_ID:-}")"
+  fi
+  find_skyrim_dir >/dev/null 2>&1 && skyrim="$(find_skyrim_dir)"
+  find_prefix >/dev/null 2>&1 && prefix="$(find_prefix)"
+
+  printf 'Skyrim Linux Bootstrap %s\n\n' "$version"
+  print_doctor_item "Operating system" "$distro" INFO
+  print_doctor_item "Package manager" "$(package_manager)" INFO
+  if is_immutable_system; then
+    print_doctor_item "System image" "immutable; Flatpak dependency path" INFO
+  else
+    print_doctor_item "System image" "traditional package management" INFO
+  fi
+  [[ "$skyrim" != "not found" ]] && status=OK || status=MISSING
+  print_doctor_item "Skyrim SE" "$skyrim" "$status"
+  [[ "$prefix" != "not found" ]] && status=OK || status=MISSING
+  print_doctor_item "Proton prefix" "$prefix" "$status"
+
+  for value in steam curl python3 xdg-mime; do
+    if command -v "$value" >/dev/null 2>&1; then
+      print_doctor_item "$value" "$(command -v "$value")" OK
+    else
+      print_doctor_item "$value" "not installed" MISSING
+    fi
+  done
+
+  if proton_launcher_command >/dev/null 2>&1; then
+    print_doctor_item "Protontricks launcher" "$(proton_launcher_command)" OK
+  else
+    print_doctor_item "Protontricks launcher" "not installed" MISSING
+  fi
+
+  if command -v easyeffects >/dev/null 2>&1; then
+    print_doctor_item "Easy Effects" "installed; may intercept Keizaal voice" WARN
+  else
+    print_doctor_item "Easy Effects" "not installed" OK
+  fi
+
+  if command -v pactl >/dev/null 2>&1; then
+    value="$(pactl get-default-sink 2>/dev/null || printf unavailable)"
+    print_doctor_item "Default audio output" "$value" INFO
+    value="$(pactl get-default-source 2>/dev/null || printf unavailable)"
+    print_doctor_item "Default microphone" "$value" INFO
+  fi
+
+  if [[ "$prefix" != "not found" ]]; then
+    [[ -f "$prefix/drive_c/Program Files/Vortex/Vortex.exe" ]] && status=OK || status=MISSING
+    print_doctor_item "Vortex" "$prefix/drive_c/Program Files/Vortex/Vortex.exe" "$status"
+    value="$prefix/drive_c/users/steamuser/AppData/Local/Programs/skyrim-rp-launcher/skyrim-rp-launcher.exe"
+    [[ -f "$value" ]] && status=OK || status=MISSING
+    print_doctor_item "Keizaal launcher" "$value" "$status"
+  fi
+}
+
+install_deps() {
+  require_linux
+  if [[ "${SLB_PROTONTRICKS_MODE:-}" == flatpak ]] || is_immutable_system; then
+    install_flatpak_protontricks
+    return
+  fi
+  case "$(package_manager)" in
+    pacman)
+      run sudo pacman -S --needed --noconfirm curl jq python protontricks xdg-utils cabextract unzip p7zip
+      ;;
+    apt)
+      run sudo apt-get update
+      run sudo apt-get install -y curl jq python3 protontricks xdg-utils cabextract unzip p7zip-full
+      ;;
+    dnf)
+      run sudo dnf install -y curl jq python3 protontricks xdg-utils cabextract unzip p7zip p7zip-plugins
+      ;;
+    zypper)
+      run sudo zypper --non-interactive install curl jq python3 protontricks xdg-utils cabextract unzip 7zip
+      ;;
+    apk)
+      run sudo apk add bash curl jq python3 xdg-utils cabextract unzip 7zip flatpak
+      install_flatpak_protontricks
+      ;;
+    unknown)
+      install_flatpak_protontricks
+      ;;
+  esac
+}
+
+install_flatpak_protontricks() {
+  local root
+  command -v flatpak >/dev/null 2>&1 || die "No supported package manager or Flatpak was found. Install curl, jq, Python 3, xdg-utils and Protontricks manually."
+  if ! flatpak remote-list --columns=name 2>/dev/null | grep -qx flathub; then
+    run flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+  fi
+  run flatpak install --user --noninteractive flathub com.github.Matoking.protontricks
+  while IFS= read -r root; do
+    run flatpak override --user --filesystem="$root" com.github.Matoking.protontricks
+  done < <(steam_roots)
+}
+
+download_vortex_installer() {
+  local destination="$state_home/downloads/Vortex-Setup.exe" url
+  run install -d "$(dirname -- "$destination")"
+  url="$(curl -fsSL https://api.github.com/repos/Nexus-Mods/Vortex/releases/latest | python3 -c '
+import json,sys
+release=json.load(sys.stdin)
+assets=release.get("assets", [])
+matches=[a["browser_download_url"] for a in assets if a.get("name", "").lower().endswith(".exe") and ("setup" in a["name"].lower() or "vortex" in a["name"].lower())]
+print(matches[0] if matches else "")
+')"
+  [[ -n "$url" ]] || die "The official GitHub release has no Windows installer asset. Download Vortex from https://www.nexusmods.com/site/mods/1 and pass its path."
+  run curl --fail --location --proto '=https' --tlsv1.2 --output "$destination" "$url"
+  printf '%s\n' "$destination"
+}
+
+install_vortex() {
+  require_linux
+  local installer="${1:-}"
+  [[ -n "$installer" ]] || installer="$(download_vortex_installer)"
+  [[ "$dry_run" == 1 || -f "$installer" ]] || die "Vortex installer not found: $installer"
+  log "Launching the official Vortex installer inside Skyrim's Proton prefix."
+  proton_launch "$installer"
+}
+
+write_vortex_wrapper() {
+  local prefix="$1"
+  local vortex_exe="$prefix/drive_c/Program Files/Vortex/Vortex.exe"
+  local wrapper="$bin_home/vortex-skyrim" handler="$bin_home/vortex-nxm-handler" launcher
+  launcher="$(proton_launcher_command)" || die "Protontricks is not installed."
+  run install -d "$bin_home" "$applications_dir"
+  [[ "$dry_run" == 1 || -f "$vortex_exe" ]] || die "Vortex.exe not found. Install Vortex first."
+
+  if [[ "$dry_run" == 0 ]]; then
+    cat >"$wrapper" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+export ELECTRON_FORCE_DEVICE_SCALE_FACTOR="$zoom_factor"
+exec $launcher --appid $appid "$vortex_exe" "\$@"
+EOF
+    cat >"$handler" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+url="\${1:-}"
+[[ "\$url" == nxm://* ]] || exit 2
+export ELECTRON_FORCE_DEVICE_SCALE_FACTOR="$zoom_factor"
+exec $launcher --appid $appid "$vortex_exe" --download "\$url"
+EOF
+    chmod 0755 "$wrapper" "$handler"
+    cat >"$applications_dir/vortex-skyrim.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Vortex (Skyrim Proton)
+Comment=Manage Skyrim Special Edition mods through Vortex
+Exec="$wrapper"
+Icon=applications-games
+Terminal=false
+Categories=Game;Utility;
+StartupNotify=true
+StartupWMClass=Vortex.exe
+EOF
+    cat >"$applications_dir/vortex-nxm.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Vortex NXM Handler
+Comment=Open Nexus Mods links in Vortex
+Exec="$handler" %u
+Icon=applications-games
+Terminal=false
+NoDisplay=true
+MimeType=x-scheme-handler/nxm;
+Categories=Game;
+EOF
+    xdg-mime default vortex-nxm.desktop x-scheme-handler/nxm
+    update-desktop-database "$applications_dir" >/dev/null 2>&1 || true
+  else
+    log "Would create $wrapper, $handler and Vortex desktop entries."
+  fi
+}
+
+patch_vortex() {
+  require_linux
+  local prefix
+  prefix="$(find_prefix)" || die "Skyrim Proton prefix was not found. Launch Skyrim once from Steam."
+  write_vortex_wrapper "$prefix"
+  log "Vortex integration installed; NXM handler: $(xdg-mime query default x-scheme-handler/nxm 2>/dev/null || printf pending)"
+}
+
+install_keizaal() {
+  require_linux
+  local installer="${1:-}"
+  [[ -n "$installer" ]] || die "Download the official Keizaal launcher installer, then pass its path: install-keizaal /path/to/KeizaalLauncherSetup.exe"
+  [[ "$dry_run" == 1 || -f "$installer" ]] || die "Keizaal installer not found: $installer"
+  log "Launching the official Keizaal installer inside Skyrim's Proton prefix."
+  proton_launch "$installer"
+}
+
+patch_keizaal() {
+  require_linux
+  local prefix launcher wrapper desktop proton_command
+  prefix="$(find_prefix)" || die "Skyrim Proton prefix was not found."
+  launcher="$prefix/drive_c/users/steamuser/AppData/Local/Programs/skyrim-rp-launcher/skyrim-rp-launcher.exe"
+  [[ "$dry_run" == 1 || -f "$launcher" ]] || die "Keizaal launcher not found. Install it first."
+  wrapper="$bin_home/keizaal-online"
+  desktop="$applications_dir/keizaal-online.desktop"
+  proton_command="$(proton_launcher_command)" || die "Protontricks is not installed."
+  run install -d "$bin_home" "$applications_dir"
+  if [[ "$dry_run" == 0 ]]; then
+    cat >"$wrapper" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+exec $proton_command --appid $appid "$launcher" "\$@"
+EOF
+    chmod 0755 "$wrapper"
+    cat >"$desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Keizaal Online (Unofficial Linux Wrapper)
+Comment=Launch the official Keizaal Online client through Skyrim's Proton prefix
+Exec="$wrapper" %u
+Icon=applications-games
+Terminal=false
+Categories=Game;
+MimeType=x-scheme-handler/skyrim-rp;
+StartupNotify=true
+StartupWMClass=steam_proton
+EOF
+    xdg-mime default keizaal-online.desktop x-scheme-handler/skyrim-rp
+    update-desktop-database "$applications_dir" >/dev/null 2>&1 || true
+  else
+    log "Would create $wrapper and $desktop."
+  fi
+  log "Keizaal callback handler: $(xdg-mime query default x-scheme-handler/skyrim-rp 2>/dev/null || printf pending)"
+}
+
+guided_setup() {
+  require_linux
+  local vortex_installer="${1:-}" keizaal_installer="${2:-}"
+  local width="${3:-}" height="${4:-}"
+  [[ -n "$vortex_installer" && -n "$keizaal_installer" ]] || \
+    die "Usage: setup VortexSetup.exe KeizaalSetup.exe [WIDTH HEIGHT]"
+  install_deps
+  install_vortex "$vortex_installer"
+  patch_vortex
+  install_keizaal "$keizaal_installer"
+  patch_keizaal
+  if [[ -n "$width" || -n "$height" ]]; then
+    [[ -n "$width" && -n "$height" ]] || die "Provide both WIDTH and HEIGHT."
+    fix_display "$width" "$height"
+  fi
+  doctor
+  log "Guided setup complete. Install the Keizaal collection through Vortex before playing."
+}
+
+fix_display() {
+  require_linux
+  local width="${1:-}" height="${2:-}" skyrim ini
+  [[ "$width" =~ ^[0-9]+$ && "$height" =~ ^[0-9]+$ ]] || die "Usage: fix-display WIDTH HEIGHT (example: 1440 900)"
+  skyrim="$(find_skyrim_dir)" || die "Skyrim installation not found."
+  ini="$skyrim/Data/SKSE/Plugins/SSEDisplayTweaks.ini"
+  [[ -f "$ini" ]] || die "SSEDisplayTweaks.ini not found; Keizaal may not be installed."
+  backup_file "$ini"
+  run python3 "$project_dir/lib/patch_ini.py" "$ini" Render \
+    Fullscreen=false Borderless=true BorderlessUpscale=false \
+    "Resolution=${width}x${height}" DisableBufferResizing=true
+  log "Pinned Skyrim's borderless render size to ${width}x${height}."
+}
+
+fix_audio() {
+  require_linux
+  local uninstall=0
+  [[ "${1:-}" == "--uninstall-easyeffects" ]] && uninstall=1
+  if command -v easyeffects >/dev/null 2>&1; then
+    warn "Easy Effects can intercept Keizaal's dedicated 16 kHz voice stream."
+    if [[ "$uninstall" == 1 ]]; then
+      confirm "Uninstall Easy Effects while preserving user presets?" || die "Cancelled."
+      case "$(package_manager)" in
+        pacman) run sudo pacman -Rns --noconfirm easyeffects ;;
+        apt) run sudo apt-get remove --autoremove -y easyeffects ;;
+        dnf) run sudo dnf remove -y easyeffects ;;
+        zypper) run sudo zypper --non-interactive remove --clean-deps easyeffects ;;
+        apk) run sudo apk del easyeffects ;;
+        unknown) die "Remove Easy Effects with your distribution's package manager, then restart Skyrim." ;;
+      esac
+    else
+      die "Re-run with: fix-audio --uninstall-easyeffects"
+    fi
+  fi
+  if command -v pactl >/dev/null 2>&1; then
+    log "Default output: $(pactl get-default-sink)"
+    log "Default microphone: $(pactl get-default-source)"
+  fi
+  log "Restart Skyrim after changing the audio graph."
+}
+
+install_desktop() {
+  local desktop="$applications_dir/skyrim-linux-bootstrap.desktop"
+  run install -d "$applications_dir"
+  if [[ "$dry_run" == 0 ]]; then
+    sed "s|@EXEC@|$bin_home/skyrim-linux-bootstrap|g" \
+      "$project_dir/share/applications/skyrim-linux-bootstrap.desktop.in" >"$desktop"
+    update-desktop-database "$applications_dir" >/dev/null 2>&1 || true
+  fi
+  log "Desktop launcher installed: $desktop"
+}
+
+gui() {
+  require_linux
+  local choice installer resolution width height
+  if command -v kdialog >/dev/null 2>&1; then
+    choice="$(kdialog --title 'Skyrim Linux Bootstrap' --menu 'Choose an action' \
+      setup 'Guided Vortex + Keizaal setup' doctor 'Run system doctor' deps 'Install dependencies' \
+      vortex-install 'Install Vortex' vortex-patch 'Patch Vortex and NXM links' \
+      keizaal-install 'Install Keizaal launcher' keizaal-patch 'Patch Keizaal and callback' \
+      display 'Fix HiDPI/alt-tab resolution' audio 'Repair Keizaal voice audio' 2>/dev/null)" || return 0
+  elif command -v zenity >/dev/null 2>&1; then
+    choice="$(zenity --list --title='Skyrim Linux Bootstrap' --text='Choose an action' \
+      --column=Action --column=Description \
+      setup 'Guided Vortex + Keizaal setup' doctor 'Run system doctor' deps 'Install dependencies' \
+      vortex-install 'Install Vortex' vortex-patch 'Patch Vortex and NXM links' \
+      keizaal-install 'Install Keizaal launcher' keizaal-patch 'Patch Keizaal and callback' \
+      display 'Fix HiDPI/alt-tab resolution' audio 'Repair Keizaal voice audio' 2>/dev/null)" || return 0
+  else
+    printf '1) Guided setup\n2) Doctor\n3) Install dependencies\n4) Install Vortex\n5) Patch Vortex\n6) Install Keizaal\n7) Patch Keizaal\n8) Fix display\n9) Fix audio\n'
+    read -r -p 'Choice: ' choice
+    case "$choice" in
+      1) choice=setup ;; 2) choice=doctor ;; 3) choice=deps ;; 4) choice=vortex-install ;;
+      5) choice=vortex-patch ;; 6) choice=keizaal-install ;; 7) choice=keizaal-patch ;;
+      8) choice=display ;; 9) choice=audio ;;
+      *) return 0 ;;
+    esac
+  fi
+  case "$choice" in
+    setup)
+      vortex_installer="$(choose_exe)" || return 0
+      keizaal_installer="$(choose_exe)" || return 0
+      resolution="$(ask_resolution)" || return 0
+      width="${resolution%x*}"; height="${resolution#*x}"
+      guided_setup "$vortex_installer" "$keizaal_installer" "$width" "$height"
+      ;;
+    doctor) doctor ;;
+    deps) install_deps ;;
+    vortex-install)
+      installer="$(choose_exe)" || return 0
+      install_vortex "$installer"
+      ;;
+    vortex-patch) patch_vortex ;;
+    keizaal-install)
+      installer="$(choose_exe)" || return 0
+      install_keizaal "$installer"
+      ;;
+    keizaal-patch) patch_keizaal ;;
+    display)
+      resolution="$(ask_resolution)" || return 0
+      width="${resolution%x*}"; height="${resolution#*x}"
+      fix_display "$width" "$height"
+      ;;
+    audio) fix_audio --uninstall-easyeffects ;;
+  esac
+}
+
+choose_exe() {
+  if command -v kdialog >/dev/null 2>&1; then
+    kdialog --getopenfilename "$HOME" '*.exe|Windows installers' 2>/dev/null
+  elif command -v zenity >/dev/null 2>&1; then
+    zenity --file-selection --title='Choose the official Windows installer' --file-filter='Windows installers | *.exe' 2>/dev/null
+  else
+    local path
+    read -r -p 'Installer path: ' path
+    printf '%s\n' "$path"
+  fi
+}
+
+ask_resolution() {
+  if command -v kdialog >/dev/null 2>&1; then
+    kdialog --inputbox 'Base render resolution (WIDTHxHEIGHT)' '1440x900' 2>/dev/null
+  elif command -v zenity >/dev/null 2>&1; then
+    zenity --entry --title='Skyrim render resolution' --text='Base render resolution (WIDTHxHEIGHT)' --entry-text='1440x900' 2>/dev/null
+  else
+    local resolution
+    read -r -p 'Base render resolution [1440x900]: ' resolution
+    printf '%s\n' "${resolution:-1440x900}"
+  fi
+}
+
+usage() {
+  cat <<EOF
+Skyrim Linux Bootstrap $version
+
+Usage: skyrim-linux-bootstrap [--dry-run] [--yes] COMMAND [ARGS]
+
+Commands:
+  setup VORTEX.exe KEIZAAL.exe [W H] Guided end-to-end installation and patching
+  doctor                              Inspect the Steam, Proton and audio setup
+  install-deps                        Install dependencies using the host package manager
+  install-vortex [VortexSetup.exe]    Run the official installer in app 489830
+  patch-vortex                        Add HiDPI launcher and nxm:// handling
+  install-keizaal SETUP.exe           Run the official Keizaal installer
+  patch-keizaal                       Add launcher and skyrim-rp:// callback
+  fix-display WIDTH HEIGHT            Pin SSE Display Tweaks render size
+  fix-audio [--uninstall-easyeffects] Detect/fix voice-routing conflicts
+  install-desktop                     Install this tool's desktop entry
+  gui                                 Open a KDE/GNOME/terminal action menu
+  version                             Print the version
+
+Environment overrides for testing:
+  SLB_DRY_RUN=1, SLB_STEAM_ROOTS=/path/one:/path/two, SLB_VORTEX_ZOOM=1.45
+  SLB_PROTONTRICKS_MODE=flatpak
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run) dry_run=1; shift ;;
+    --yes) assume_yes=1; shift ;;
+    --help|-h) usage; exit 0 ;;
+    *) break ;;
+  esac
+done
+
+command_name="${1:-gui}"
+[[ $# -gt 0 ]] && shift || true
+case "$command_name" in
+  setup) guided_setup "$@" ;;
+  doctor) doctor "$@" ;;
+  install-deps) install_deps "$@" ;;
+  install-vortex) install_vortex "$@" ;;
+  patch-vortex) patch_vortex "$@" ;;
+  install-keizaal) install_keizaal "$@" ;;
+  patch-keizaal) patch_keizaal "$@" ;;
+  fix-display) fix_display "$@" ;;
+  fix-audio) fix_audio "$@" ;;
+  install-desktop) install_desktop "$@" ;;
+  gui) gui "$@" ;;
+  version|--version|-V) printf '%s\n' "$version" ;;
+  *) usage >&2; exit 2 ;;
+esac

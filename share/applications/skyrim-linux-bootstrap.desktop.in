@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Skyrim Linux Bootstrap
+Comment=Install and repair Vortex and Keizaal Online across Linux distributions
+Exec="@EXEC@" gui
+Icon=applications-games
+Terminal=true
+Categories=Game;Utility;
+Keywords=Skyrim;Vortex;Keizaal;Proton;Mods;
+StartupNotify=true

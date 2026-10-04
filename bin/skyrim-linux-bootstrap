@@ -234,7 +234,7 @@ doctor() {
     fi
     [[ -f "$prefix/drive_c/Program Files/Vortex/Vortex.exe" ]] && status=OK || status=MISSING
     print_doctor_item "Vortex" "$prefix/drive_c/Program Files/Vortex/Vortex.exe" "$status"
-    value="$prefix/drive_c/users/steamuser/AppData/Local/Programs/skyrim-rp-launcher/skyrim-rp-launcher.exe"
+    value="$prefix/drive_c/users/steamuser/AppData/Local/Programs/skyrim-rp-launcher/keizaal-online.exe"
     [[ -f "$value" ]] && status=OK || status=MISSING
     print_doctor_item "Keizaal launcher" "$value" "$status"
   fi
@@ -453,7 +453,7 @@ patch_keizaal() {
   require_linux
   local prefix launcher wrapper desktop proton_command
   prefix="$(find_prefix)" || die "Skyrim Proton prefix was not found."
-  launcher="$prefix/drive_c/users/steamuser/AppData/Local/Programs/skyrim-rp-launcher/skyrim-rp-launcher.exe"
+  launcher="$prefix/drive_c/users/steamuser/AppData/Local/Programs/skyrim-rp-launcher/keizaal-online.exe"
   [[ "$dry_run" == 1 || -f "$launcher" ]] || die "Keizaal launcher not found. Install it first."
   wrapper="$bin_home/keizaal-online"
   desktop="$applications_dir/keizaal-online.desktop"
